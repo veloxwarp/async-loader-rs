@@ -2,6 +2,9 @@
 name = "async-loader"
 version = "0.2.0"
 edition = "2021"
+repository = "https://github.com/veloxwarp/async-loader-rs"
+license = "MIT"
+description = "Load and cache data from any network service."
 
 [dependencies]
 tokio = { version = "1.45" }
