@@ -6,14 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{
-    body::Body,
-    http::{HeaderValue, Response},
-    response::IntoResponse,
-    Json,
-};
+use axum::{body::Body, http::Response, response::IntoResponse, Json};
 use parking_lot::{Mutex, RwLock};
-use reqwest::{header::CACHE_CONTROL, StatusCode};
+#[cfg(test)]
+use reqwest::header::CACHE_CONTROL;
+use reqwest::StatusCode;
 use tokio::sync::broadcast;
 
 /// Provides access to a cached value with automatic reload.
@@ -216,20 +213,11 @@ impl<Loader: CacheLoader> Clone for ValueForRender<Loader> {
 impl<Loader: CacheLoader> ValueForRender<Loader> {
     /// Convert into an axum Response
     ///
-    /// Handles all the details of cache headers, status codes, and content-type.
-    pub fn into_response(self, config: &AsyncLoaderConfig) -> axum::response::Response {
+    /// Preserves loader-provided headers, status codes, and content-type.
+    /// HTTP cache policy belongs to the caller; no Cache-Control is added.
+    pub fn into_response(self, _config: &AsyncLoaderConfig) -> axum::response::Response {
         match self {
-            ValueForRender::Success { value, loaded } => {
-                let mut res = Loader::into_response(&*value);
-                if let Some(cache_time) = config.reload_delay.checked_sub(loaded.elapsed()) {
-                    if let Ok(value) =
-                        HeaderValue::from_str(&format!("public, max-age={}", cache_time.as_secs()))
-                    {
-                        res.headers_mut().insert(CACHE_CONTROL, value);
-                    }
-                }
-                res
-            }
+            ValueForRender::Success { value, .. } => Loader::into_response(&*value),
             ValueForRender::Error {
                 message,
                 status,
@@ -491,9 +479,32 @@ impl<Loader: CacheLoader> AsyncLoader<Loader> {
         key: Loader::Key,
         force_reload: bool,
     ) -> BroadcastOrValue<Loader> {
-        // Danger Will Robinson! We only consider it safe to lock here based on
-        // the rest of this method performing no long-lived blocking actions.
-        let mutex_by_key = self.get_mutex_by_key(&key);
+        // Keep the map entry alive until the per-key decision is complete.
+        // A no-store completion can remove an entry after lookup; retry rather
+        // than start an update on detached state in that case.
+        loop {
+            let mutex_by_key = self.get_mutex_by_key(&key);
+            let map = self.inner.per_key.read();
+            if map
+                .get(&key)
+                .is_some_and(|state| Arc::ptr_eq(state, &mutex_by_key))
+            {
+                return self.get_broadcast_or_value_locked(
+                    key.clone(),
+                    force_reload,
+                    &mutex_by_key,
+                );
+            }
+        }
+    }
+
+    fn get_broadcast_or_value_locked(
+        &self,
+        key: Loader::Key,
+        force_reload: bool,
+        mutex_by_key: &Mutex<InnerMut<Loader>>,
+    ) -> BroadcastOrValue<Loader> {
+        // Map-before-key lock ordering is shared with no-store completion.
         let mut guard = mutex_by_key.lock();
 
         // Check if the latest value can be used or not
@@ -551,9 +562,12 @@ impl<Loader: CacheLoader> AsyncLoader<Loader> {
                 let (sender, receiver) = broadcast::channel(1);
                 guard.broadcast = Some(sender.clone());
                 tokio::task::spawn(self.clone().do_update(sender, key, stale_cache.clone()));
-                BroadcastOrValue::Broadcast {
-                    broadcast: receiver,
-                    stale_cache,
+                match value {
+                    Some(value) => BroadcastOrValue::Value(value),
+                    None => BroadcastOrValue::Broadcast {
+                        broadcast: receiver,
+                        stale_cache,
+                    },
                 }
             }
         }
@@ -567,33 +581,37 @@ impl<Loader: CacheLoader> AsyncLoader<Loader> {
         stale_cache: Option<Latest<Loader>>,
     ) {
         // Run the loader and then render to JSON.
-        let res = self.inner.loader.load(key.clone()).await.map(Arc::new);
+        // Isolate both invocation and polling panics in a task. The supervisor
+        // still completes the update, releases waiters, and permits retries.
+        let loader = self.clone();
+        let load_key = key.clone();
+        let res = match tokio::task::spawn(async move { loader.inner.loader.load(load_key).await })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Loader task panicked or was cancelled")),
+        }
+        .map(Arc::new);
         let config = self.get_cacher_config();
 
-        {
-            // New block to avoid holding the guard for too long.
+        if !config.store_cache {
+            // Remove the in-flight entry atomically with respect to lookups.
+            // Do not temporarily publish a cached value or clear the slot while
+            // another caller can start a task that this completion would remove.
+            let mut map = self.inner.per_key.write();
+            if let Some(state) = map.remove(&key) {
+                state.lock().broadcast = None;
+            }
+        } else {
             let mutex_by_key = self.get_mutex_by_key(&key);
             let mut guard = mutex_by_key.lock();
-
-            // First we wipe out the old broadcast. We do this before
-            // broadcasting the updates to ensure that, if a task gets a Receiver out of
-            // get_broadcast_or_value, it's guaranteed to receive the message below.
             guard.broadcast = None;
-
-            // And if the load was successful, update the cache.
             if let Ok(value) = &res {
                 guard.latest = Some(Latest {
                     loaded: Instant::now(),
                     value: value.clone(),
-                })
+                });
             }
-        }
-
-        if !config.store_cache {
-            // If we are not storing the cache, then take a write lock
-            // and remove the cached item
-            let mut write_guard = self.inner.per_key.write();
-            write_guard.remove(&key);
         }
 
         // Convert into a ValueForRender form.
@@ -733,77 +751,303 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reload_happens() {
-        let cacher = TestLoader::build();
-        let item = cacher.get_value(()).await;
-        assert!(item.is_success());
+    async fn no_store_completion_leaves_no_cached_value() {
+        let cacher = gated_cache(false, false);
+        let mut first = std::pin::pin!(cacher.get_value(()));
+        let mut second = std::pin::pin!(cacher.get_value(()));
+        assert!(poll_once(first.as_mut()).await.is_pending());
+        assert!(poll_once(second.as_mut()).await.is_pending());
+        cacher.inner.loader.started.notified().await;
+        let state = cacher.get_mutex_by_key(&());
+        assert_eq!(
+            cacher
+                .inner
+                .loader
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        cacher.inner.loader.release.notify_one();
+        assert_eq!(*first.await.get_success_value(), 20);
+        assert_eq!(*second.await.get_success_value(), 20);
+        assert!(
+            state.lock().latest.is_none(),
+            "no-store must never publish a cached value"
+        );
+        assert_eq!(cacher.inner.metrics().length, 0);
+        let mut retry = std::pin::pin!(cacher.get_value(()));
+        assert!(poll_once(retry.as_mut()).await.is_pending());
+        cacher.inner.loader.started.notified().await;
+        cacher.inner.loader.release.notify_one();
+        assert_eq!(*retry.await.get_success_value(), 21);
+    }
 
-        // This tests the UseNoReload case
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let item = cacher.get_value(()).await;
-        assert!(item.is_success());
+    struct HeaderLoader;
 
-        // This tests the UseAndReload case, but the first attempt will be a failure
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let item = cacher.get_value(()).await;
-        assert!(!item.is_success());
+    impl CacheLoader for HeaderLoader {
+        type Key = String;
+        type Output = String;
 
-        // Let 1 seconds pass to make the stale value invalid and this
-        // time we will get fresh data
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let item = cacher.get_value(()).await;
-        assert!(item.is_success());
-        match item {
-            ValueForRender::Success { value, loaded: _ } => {
-                assert_eq!(*value, 2, "Got new value in the reload");
-            }
-            ValueForRender::Error { .. } => panic!("Retry would have succedded"),
+        async fn load(&self, key: String) -> anyhow::Result<String> {
+            Ok(key)
         }
 
-        // Let 2 seconds pass so that a fresh value is tried now
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value(()).await;
-        assert!(item.is_success());
-        match item {
-            ValueForRender::Success { value, loaded: _ } => {
-                assert_eq!(*value, 3, "Got stale value in the reload");
+        fn into_response(output: &String) -> super::Response<super::Body> {
+            let mut response = super::IntoResponse::into_response(super::Json(output));
+            if !output.is_empty() {
+                response
+                    .headers_mut()
+                    .insert(super::CACHE_CONTROL, output.parse().unwrap());
             }
-            ValueForRender::Error { .. } => panic!("Retry would have succedded"),
+            response
         }
     }
 
-    #[tokio::test]
-    async fn test_staleness() {
-        let cacher = TestLoader::build_stale();
-        let item = cacher.get_value_allow_stale(()).await;
-        assert_eq!(item.get_success_value(), &1);
+    #[test]
+    fn response_cache_policy_is_owned_by_loader() {
+        let config = TestLoader::build();
+        for policy in ["no-store", "private, max-age=5", "public, max-age=60", ""] {
+            let value = ValueForRender::<HeaderLoader>::Success {
+                value: super::Arc::new(policy.to_owned()),
+                loaded: super::Instant::now(),
+            };
+            let response = value.into_response(config.get_cacher_config());
+            if policy.is_empty() {
+                assert!(!response.headers().contains_key(super::CACHE_CONTROL));
+            } else {
+                assert_eq!(response.headers()[super::CACHE_CONTROL], policy);
+            }
+        }
+    }
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value_allow_stale(()).await;
-        assert_eq!(*item.get_success_value(), 1);
+    struct GateLoader {
+        calls: std::sync::atomic::AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        fail: bool,
+    }
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value_allow_stale(()).await;
-        assert_eq!(*item.get_success_value(), 2);
+    impl CacheLoader for GateLoader {
+        type Key = ();
+        type Output = usize;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value_allow_stale(()).await;
-        assert_eq!(*item.get_success_value(), 3);
+        async fn load(&self, (): ()) -> anyhow::Result<usize> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                Err(super::ErrorResponse {
+                    status: super::StatusCode::BAD_GATEWAY,
+                    message: "unavailable".into(),
+                }
+                .into())
+            } else {
+                Ok(call + 20)
+            }
+        }
+    }
+
+    fn gated_cache(store_cache: bool, fail: bool) -> AsyncLoader<GateLoader> {
+        AsyncLoaderBuilder {
+            reload_delay: Some(Duration::from_secs(10)),
+            stale_delay: StaleDelay::Duration(Duration::from_secs(10)),
+            store_cache,
+            disable_loader: false,
+        }
+        .build(GateLoader {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            fail,
+        })
+    }
+
+    fn seed_cache(cacher: &AsyncLoader<GateLoader>, age: u64) {
+        cacher.get_mutex_by_key(&()).lock().latest = Some(super::Latest {
+            loaded: super::Instant::now() - Duration::from_secs(age),
+            value: super::Arc::new(10),
+        });
+    }
+
+    async fn poll_once<F: std::future::Future>(
+        future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        let mut future = future;
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
     }
 
     #[tokio::test]
-    async fn test_staleness_in_get_value() {
+    async fn first_refresh_returns_cache_and_coalesces_forced_waiter() {
+        let cacher = gated_cache(true, false);
+        seed_cache(&cacher, 15);
+        let mut first = std::pin::pin!(cacher.get_value(()));
+        let std::task::Poll::Ready(value) = poll_once(first.as_mut()).await else {
+            panic!("first refresh caller must receive cache without waiting");
+        };
+        assert_eq!(*value.get_success_value(), 10);
+        cacher.inner.loader.started.notified().await;
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 10);
+        let mut fresh = std::pin::pin!(cacher.get_latest_value(()));
+        assert!(poll_once(fresh.as_mut()).await.is_pending());
+        assert_eq!(
+            cacher
+                .inner
+                .loader
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        cacher.inner.loader.release.notify_one();
+        assert_eq!(*fresh.await.get_success_value(), 20);
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 20);
+    }
+
+    struct PanicLoader {
+        calls: std::sync::atomic::AtomicUsize,
+        invocation: bool,
+    }
+
+    impl CacheLoader for PanicLoader {
+        type Key = ();
+        type Output = usize;
+
+        fn load(&self, (): ()) -> impl std::future::Future<Output = anyhow::Result<usize>> + Send {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(!(call == 0 && self.invocation), "invocation panic");
+            async move {
+                assert!(call != 0, "poll panic");
+                Ok(call)
+            }
+        }
+    }
+
+    async fn check_panic_retry(invocation: bool) {
+        let cacher = AsyncLoaderBuilder {
+            reload_delay: None,
+            stale_delay: StaleDelay::Default,
+            store_cache: true,
+            disable_loader: false,
+        }
+        .build(PanicLoader {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            invocation,
+        });
+        let first = cacher.get_broadcast_or_value((), false);
+        let second = cacher.get_broadcast_or_value((), false);
+        for waiter in [first, second] {
+            let super::BroadcastOrValue::Broadcast { mut broadcast, .. } = waiter else {
+                panic!("expected waiting caller");
+            };
+            let result = tokio::time::timeout(Duration::from_secs(1), broadcast.recv())
+                .await
+                .expect("panic must release callers")
+                .expect("error must be broadcast");
+            assert!(matches!(
+                result,
+                ValueForRender::Error {
+                    status: super::StatusCode::INTERNAL_SERVER_ERROR,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 1);
+    }
+
+    #[tokio::test]
+    async fn invocation_panic_releases_waiters_and_retries() {
+        check_panic_retry(true).await;
+    }
+
+    #[tokio::test]
+    async fn polling_panic_releases_waiters_and_retries() {
+        check_panic_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_preserves_usable_cache() {
+        let cacher = gated_cache(true, true);
+        seed_cache(&cacher, 15);
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 10);
+        cacher.inner.loader.started.notified().await;
+        let mut fresh = std::pin::pin!(cacher.get_latest_value(()));
+        assert!(poll_once(fresh.as_mut()).await.is_pending());
+        cacher.inner.loader.release.notify_one();
+        assert!(matches!(
+            fresh.await,
+            ValueForRender::Error {
+                status: super::StatusCode::BAD_GATEWAY,
+                ..
+            }
+        ));
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 10);
+        cacher.inner.loader.started.notified().await;
+        assert_eq!(
+            cacher
+                .inner
+                .loader
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let mut retry = std::pin::pin!(cacher.get_latest_value(()));
+        assert!(poll_once(retry.as_mut()).await.is_pending());
+        cacher.inner.loader.release.notify_one();
+        assert!(matches!(
+            retry.await,
+            ValueForRender::Error {
+                status: super::StatusCode::BAD_GATEWAY,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_cache_waits_and_failure_can_fall_back() {
+        let cacher = gated_cache(true, true);
+        seed_cache(&cacher, 25);
+        let mut strict = std::pin::pin!(cacher.get_value(()));
+        let mut fallback = std::pin::pin!(cacher.get_value_allow_stale(()));
+        assert!(poll_once(strict.as_mut()).await.is_pending());
+        assert!(poll_once(fallback.as_mut()).await.is_pending());
+        cacher.inner.loader.started.notified().await;
+        cacher.inner.loader.release.notify_one();
+        assert!(matches!(
+            strict.await,
+            ValueForRender::Error {
+                status: super::StatusCode::BAD_GATEWAY,
+                stale_cache: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(*fallback.await.get_success_value(), 10);
+        assert_eq!(
+            cacher
+                .inner
+                .loader
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_stale_never_expires_but_refreshes() {
         let cacher = TestLoader::build_stale();
-        let item = cacher.get_value(()).await;
-        assert_eq!(item.get_success_value(), &1);
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value(()).await;
-        assert!(!item.is_success());
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value(()).await;
-        assert_eq!(*item.get_success_value(), 2);
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 1);
+        cacher
+            .get_mutex_by_key(&())
+            .lock()
+            .latest
+            .as_mut()
+            .unwrap()
+            .loaded = super::Instant::now() - Duration::from_secs(100);
+        let mut cached = std::pin::pin!(cacher.get_value(()));
+        let std::task::Poll::Ready(value) = poll_once(cached.as_mut()).await else {
+            panic!("AllowStale cache must be immediately usable");
+        };
+        assert_eq!(*value.get_success_value(), 1);
+        assert!(!cacher.get_latest_value(()).await.is_success());
+        assert_eq!(*cacher.get_latest_value(()).await.get_success_value(), 2);
     }
 
     #[tokio::test]
@@ -824,42 +1068,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_without_store() {
-        async fn test_task(cacher: AsyncLoader<TestLoader>) -> String {
-            let result = cacher.get_value(()).await;
-            match result {
-                ValueForRender::Success { value, .. } => value.to_string(),
-                ValueForRender::Error { .. } => "error".to_owned(),
-            }
-        }
-
         let cacher = TestLoader::build_without_cache();
-
-        let item = cacher.get_value(()).await;
-        assert_eq!(item.get_success_value(), &1);
-
-        let item = cacher.get_value(()).await;
-        assert!(!item.is_success());
-
-        let mut set = JoinSet::new();
-        for _ in 0..5 {
-            let cacher = cacher.clone();
-            set.spawn(test_task(cacher));
-        }
-
-        // Checks that even with the burst of request we get the value
-        // 2.  This confirms that all the five task didn't lead
-        // to computation of new value.
-        let mut index = 0;
-        while let Some(res) = set.join_next().await {
-            assert_eq!(res.unwrap(), "2".to_owned());
-            index += 1;
-        }
-
-        assert_eq!(index, 5, "5 tokio tasks executed");
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let item = cacher.get_value(()).await;
-        assert_eq!(*item.get_success_value(), 3);
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 1);
+        assert!(!cacher.get_value(()).await.is_success());
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 2);
+        assert_eq!(*cacher.get_value(()).await.get_success_value(), 3);
+        assert_eq!(cacher.inner.metrics().length, 0);
     }
 
     #[tokio::test]
